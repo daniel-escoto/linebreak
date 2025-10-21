@@ -1,2 +1,0 @@
-# thinkLikeMagnus
-# thinkLikeMagnus
