@@ -64,19 +64,24 @@ class CursorUsageTracker(rumps.App):
         
         try:
             reset_date = datetime.strptime(self.data['reset_date'], '%Y-%m-%d')
-            days_since_reset = (now - reset_date).days
+            
+            # Calculate cycle start date (30 days before reset date)
+            cycle_start = reset_date - timedelta(days=30)
+            days_since_start = (now - cycle_start).days
             
             # Calculate days in this billing cycle (30 days)
             days_in_cycle = 30
-            days_remaining = max(0, days_in_cycle - days_since_reset)
-            next_reset_date = reset_date + timedelta(days=30)
+            days_remaining = max(0, (reset_date - now).days)
+            
+            # Ensure we don't show negative days since start
+            days_since_start = max(0, days_since_start)
             
             return {
-                'days_since_reset': days_since_reset,
+                'days_since_reset': days_since_start,
                 'days_in_cycle': days_in_cycle,
                 'days_remaining': days_remaining,
                 'reset_date': reset_date.strftime('%Y-%m-%d'),
-                'next_reset': next_reset_date.strftime('%Y-%m-%d')
+                'cycle_start': cycle_start.strftime('%Y-%m-%d')
             }
         except ValueError:
             return None
