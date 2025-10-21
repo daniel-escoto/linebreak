@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
 Cursor Usage Tracker - macOS Menu Bar App
-Tracks Cursor usage and predicts if you'll exceed monthly limits
+Tracks Cursor usage percentage and projects end-of-cycle usage
 """
 
 import rumps
 import json
-import os
 from datetime import datetime, timedelta
 from pathlib import Path
-from calendar import monthrange
 
 
 class CursorUsageTracker(rumps.App):
@@ -29,25 +27,25 @@ class CursorUsageTracker(rumps.App):
             try:
                 with open(self.data_file, 'r') as f:
                     data = json.load(f)
-                    # Check if we've moved to a new month
-                    last_month = data.get('last_update_month')
-                    current_month = datetime.now().strftime('%Y-%m')
-                    if last_month != current_month:
-                        # New month - reset usage but keep limit
-                        data['current_usage'] = 0
-                        data['last_update_month'] = current_month
+                    
+                    # Migrate old data structure if needed
+                    if 'current_percentage' not in data:
+                        # Old structure detected, create new structure
+                        data = {
+                            'reset_date': data.get('reset_date'),
+                            'current_percentage': 0.0
+                        }
+                        # Save the migrated data
                         self.save_data(data)
+                    
                     return data
             except (json.JSONDecodeError, KeyError):
                 pass
         
-        # Default data
+        # Default data - prompt user for reset date on first run
         return {
-            'monthly_limit': 500,  # Default limit in requests/dollars/whatever unit
-            'current_usage': 0,
-            'last_update_month': datetime.now().strftime('%Y-%m'),
-            'last_updated': None,
-            'reset_date': None  # Custom reset date (YYYY-MM-DD format)
+            'reset_date': None,  # Will be set on first use
+            'current_percentage': 0.0
         }
     
     def save_data(self, data=None):
@@ -57,166 +55,93 @@ class CursorUsageTracker(rumps.App):
         with open(self.data_file, 'w') as f:
             json.dump(data, f, indent=2)
     
-    def get_month_stats(self):
-        """Calculate current month statistics"""
+    def get_cycle_stats(self):
+        """Calculate current cycle statistics"""
         now = datetime.now()
         
-        # Check if we have a custom reset date
-        if self.data.get('reset_date'):
-            try:
-                reset_date = datetime.strptime(self.data['reset_date'], '%Y-%m-%d')
-                # Calculate days since last reset
-                days_since_reset = (now - reset_date).days
-                
-                # If it's been more than 30 days since reset, we're in a new cycle
-                if days_since_reset >= 30:
-                    # Update to new reset date (30 days from now)
-                    new_reset = now + timedelta(days=30)
-                    self.data['reset_date'] = new_reset.strftime('%Y-%m-%d')
-                    self.data['current_usage'] = 0
-                    self.data['last_updated'] = now.isoformat()
-                    self.save_data()
-                    days_since_reset = 0
-                
-                # Calculate days in this billing cycle (30 days)
-                days_in_cycle = 30
-                days_remaining = days_in_cycle - days_since_reset
-                
-                return {
-                    'current_day': days_since_reset + 1,
-                    'days_in_month': days_in_cycle,
-                    'days_remaining': max(0, days_remaining),
-                    'reset_date': reset_date.strftime('%Y-%m-%d'),
-                    'next_reset': (reset_date + timedelta(days=30)).strftime('%Y-%m-%d')
-                }
-            except ValueError:
-                # Invalid reset date format, fall back to monthly
-                pass
+        if not self.data.get('reset_date'):
+            return None
         
-        # Default monthly calculation
-        current_day = now.day
-        days_in_month = monthrange(now.year, now.month)[1]
-        days_remaining = days_in_month - current_day
-        
-        return {
-            'current_day': current_day,
-            'days_in_month': days_in_month,
-            'days_remaining': days_remaining,
-            'reset_date': None,
-            'next_reset': None
-        }
+        try:
+            reset_date = datetime.strptime(self.data['reset_date'], '%Y-%m-%d')
+            days_since_reset = (now - reset_date).days
+            
+            # Calculate days in this billing cycle (30 days)
+            days_in_cycle = 30
+            days_remaining = max(0, days_in_cycle - days_since_reset)
+            next_reset_date = reset_date + timedelta(days=30)
+            
+            return {
+                'days_since_reset': days_since_reset,
+                'days_in_cycle': days_in_cycle,
+                'days_remaining': days_remaining,
+                'reset_date': reset_date.strftime('%Y-%m-%d'),
+                'next_reset': next_reset_date.strftime('%Y-%m-%d')
+            }
+        except ValueError:
+            return None
     
     def calculate_prediction(self):
-        """Calculate predicted end-of-month usage"""
-        stats = self.get_month_stats()
-        current_usage = self.data['current_usage']
+        """Calculate predicted end-of-cycle percentage"""
+        stats = self.get_cycle_stats()
+        if not stats or stats['days_since_reset'] <= 0:
+            return self.data['current_percentage']
         
-        if stats['current_day'] == 0:
-            return 0
+        current_percentage = self.data['current_percentage']
         
-        # Linear extrapolation
-        daily_average = current_usage / stats['current_day']
-        predicted_usage = daily_average * stats['days_in_month']
+        # Linear extrapolation based on percentage growth per day
+        daily_average = current_percentage / stats['days_since_reset']
+        predicted_percentage = daily_average * stats['days_in_cycle']
         
-        return predicted_usage
-    
-    def get_status(self):
-        """Determine current status (on track, warning, over)"""
-        current_usage = self.data['current_usage']
-        limit = self.data['monthly_limit']
-        stats = self.get_month_stats()
-        
-        if stats['current_day'] == 0:
-            return 'on_track', '🟢'
-        
-        # Calculate expected usage at this point in the month
-        expected_usage = (limit / stats['days_in_month']) * stats['current_day']
-        
-        usage_ratio = current_usage / expected_usage if expected_usage > 0 else 0
-        
-        if usage_ratio < 0.8:
-            return 'on_track', '🟢'
-        elif usage_ratio < 1.0:
-            return 'warning', '🟡'
-        else:
-            return 'over', '🔴'
+        return predicted_percentage
     
     def update_menu(self, _=None):
         """Update the menu bar display"""
         self.menu.clear()
         
-        current_usage = self.data['current_usage']
-        limit = self.data['monthly_limit']
-        stats = self.get_month_stats()
-        predicted = self.calculate_prediction()
-        status, icon = self.get_status()
+        current_percentage = self.data['current_percentage']
+        stats = self.get_cycle_stats()
         
-        # Update title with status icon
-        usage_pct = (current_usage / limit * 100) if limit > 0 else 0
-        self.title = f"{icon} {usage_pct:.0f}%"
+        # Update title with just the percentage
+        self.title = f"{current_percentage:.0f}%"
         
         # Menu items
-        self.menu.add(rumps.MenuItem(f"Cursor Usage Tracker", callback=None))
+        self.menu.add(rumps.MenuItem("Cursor Usage Tracker", callback=None))
         self.menu.add(rumps.separator)
         
-        # Current stats
-        self.menu.add(rumps.MenuItem(f"Current: {current_usage:.1f} / {limit:.1f}", callback=None))
-        self.menu.add(rumps.MenuItem(f"Usage: {usage_pct:.1f}%", callback=None))
+        # Current percentage
+        self.menu.add(rumps.MenuItem(f"Current: {current_percentage:.1f}%", callback=None))
         self.menu.add(rumps.separator)
         
-        # Time stats
-        if stats.get('reset_date'):
-            self.menu.add(rumps.MenuItem(f"Day {stats['current_day']} of {stats['days_in_month']}", callback=None))
-            self.menu.add(rumps.MenuItem(f"Reset: {stats['reset_date']}", callback=None))
-            if stats.get('next_reset'):
-                self.menu.add(rumps.MenuItem(f"Next: {stats['next_reset']}", callback=None))
+        # Cycle stats
+        if stats:
+            self.menu.add(rumps.MenuItem(f"Reset Date: {stats['reset_date']}", callback=None))
+            self.menu.add(rumps.MenuItem(f"Day {stats['days_since_reset']} of {stats['days_in_cycle']}", callback=None))
+            self.menu.add(rumps.MenuItem(f"{stats['days_remaining']} days remaining", callback=None))
+            self.menu.add(rumps.separator)
+            
+            # Prediction
+            predicted = self.calculate_prediction()
+            self.menu.add(rumps.MenuItem(f"Projected: {predicted:.1f}%", callback=None))
         else:
-            self.menu.add(rumps.MenuItem(f"Day {stats['current_day']} of {stats['days_in_month']}", callback=None))
-        
-        self.menu.add(rumps.MenuItem(f"{stats['days_remaining']} days remaining", callback=None))
-        self.menu.add(rumps.separator)
-        
-        # Prediction
-        predicted_pct = (predicted / limit * 100) if limit > 0 else 0
-        self.menu.add(rumps.MenuItem(f"Predicted: {predicted:.1f} ({predicted_pct:.0f}%)", callback=None))
-        
-        # Daily averages
-        if stats['current_day'] > 0:
-            daily_avg = current_usage / stats['current_day']
-            self.menu.add(rumps.MenuItem(f"Daily avg: {daily_avg:.1f}", callback=None))
-        
-        if stats['days_remaining'] > 0:
-            recommended_daily = (limit - current_usage) / stats['days_remaining']
-            if recommended_daily < 0:
-                self.menu.add(rumps.MenuItem(f"Over budget by {abs(recommended_daily * stats['days_remaining']):.1f}", callback=None))
-            else:
-                self.menu.add(rumps.MenuItem(f"Recommended: {recommended_daily:.1f}/day", callback=None))
+            self.menu.add(rumps.MenuItem("No reset date set", callback=None))
+            self.menu.add(rumps.MenuItem("Use 'Reset Cycle...' to set", callback=None))
         
         self.menu.add(rumps.separator)
         
         # Actions
-        self.menu.add(rumps.MenuItem("Update Usage...", callback=self.update_usage))
-        self.menu.add(rumps.MenuItem("Set Monthly Limit...", callback=self.set_limit))
-        self.menu.add(rumps.MenuItem("Set Reset Date...", callback=self.set_reset_date))
-        self.menu.add(rumps.MenuItem("Reset Month", callback=self.reset_month))
-        self.menu.add(rumps.separator)
-        
-        # Last updated
-        if self.data['last_updated']:
-            last_update = datetime.fromisoformat(self.data['last_updated'])
-            time_str = last_update.strftime('%b %d, %I:%M %p')
-            self.menu.add(rumps.MenuItem(f"Updated: {time_str}", callback=None))
-        
+        self.menu.add(rumps.MenuItem("Update Percentage...", callback=self.update_percentage))
+        self.menu.add(rumps.MenuItem("Reset Cycle...", callback=self.reset_cycle))
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("Quit", callback=rumps.quit_application))
     
-    @rumps.clicked("Update Usage...")
-    def update_usage(self, _):
-        """Prompt user to update current usage"""
-        current = self.data['current_usage']
+    @rumps.clicked("Update Percentage...")
+    def update_percentage(self, _):
+        """Prompt user to update current percentage"""
+        current = self.data['current_percentage']
         response = rumps.Window(
-            title="Update Current Usage",
-            message=f"Enter your current Cursor usage:\n(Current: {current:.1f})",
+            title="Update Current Percentage",
+            message=f"Enter your current Cursor usage percentage (0-100):\n(Current: {current:.1f}%)",
             default_text=str(current),
             ok="Update",
             cancel="Cancel",
@@ -225,108 +150,61 @@ class CursorUsageTracker(rumps.App):
         
         if response.clicked:
             try:
-                new_usage = float(response.text)
-                if new_usage < 0:
-                    rumps.alert("Invalid Input", "Usage cannot be negative")
+                new_percentage = float(response.text)
+                if new_percentage < 0 or new_percentage > 100:
+                    rumps.alert("Invalid Input", "Percentage must be between 0 and 100")
                     return
                 
-                self.data['current_usage'] = new_usage
-                self.data['last_updated'] = datetime.now().isoformat()
+                self.data['current_percentage'] = new_percentage
                 self.save_data()
                 self.update_menu()
                 
                 # Show confirmation
                 rumps.notification(
-                    title="Usage Updated",
-                    subtitle=f"Current usage: {new_usage:.1f}",
+                    title="Percentage Updated",
+                    subtitle=f"Current usage: {new_percentage:.1f}%",
                     message=""
                 )
             except ValueError:
                 rumps.alert("Invalid Input", "Please enter a valid number")
     
-    @rumps.clicked("Set Monthly Limit...")
-    def set_limit(self, _):
-        """Prompt user to set monthly limit"""
-        current_limit = self.data['monthly_limit']
-        response = rumps.Window(
-            title="Set Monthly Limit",
-            message=f"Enter your monthly Cursor usage limit:\n(Current: {current_limit:.1f})",
-            default_text=str(current_limit),
-            ok="Set",
-            cancel="Cancel",
-            dimensions=(320, 20)
-        ).run()
-        
-        if response.clicked:
-            try:
-                new_limit = float(response.text)
-                if new_limit <= 0:
-                    rumps.alert("Invalid Input", "Limit must be greater than zero")
-                    return
-                
-                self.data['monthly_limit'] = new_limit
-                self.save_data()
-                self.update_menu()
-                
-                rumps.notification(
-                    title="Limit Updated",
-                    subtitle=f"Monthly limit: {new_limit:.1f}",
-                    message=""
-                )
-            except ValueError:
-                rumps.alert("Invalid Input", "Please enter a valid number")
-    
-    @rumps.clicked("Set Reset Date...")
-    def set_reset_date(self, _):
-        """Set custom reset date for billing cycle"""
-        current_reset = self.data.get('reset_date', 'Not set')
-        response = rumps.Window(
-            title="Set Reset Date",
-            message=f"Enter your billing cycle reset date (YYYY-MM-DD):\n(Current: {current_reset})\n\nExample: 2025-11-19",
-            default_text="2025-11-19",
-            ok="Set",
-            cancel="Cancel",
-            dimensions=(400, 20)
-        ).run()
-        
-        if response.clicked:
-            try:
-                # Validate date format
-                test_date = datetime.strptime(response.text, '%Y-%m-%d')
-                self.data['reset_date'] = response.text
-                self.save_data()
-                self.update_menu()
-                
-                rumps.notification(
-                    title="Reset Date Set",
-                    subtitle=f"Billing cycle resets: {response.text}",
-                    message=""
-                )
-            except ValueError:
-                rumps.alert("Invalid Date", "Please use YYYY-MM-DD format (e.g., 2025-11-19)")
-    
-    @rumps.clicked("Reset Month")
-    def reset_month(self, _):
-        """Reset usage for a new month"""
+    @rumps.clicked("Reset Cycle...")
+    def reset_cycle(self, _):
+        """Reset cycle and set new reset date"""
         response = rumps.alert(
-            title="Reset Month?",
-            message="This will reset your usage to 0. Continue?",
+            title="Reset Cycle?",
+            message="This will reset your percentage to 0 and ask for a new reset date. Continue?",
             ok="Reset",
             cancel="Cancel"
         )
         
         if response == 1:  # OK clicked
-            self.data['current_usage'] = 0
-            self.data['last_update_month'] = datetime.now().strftime('%Y-%m')
-            self.data['last_updated'] = datetime.now().isoformat()
-            self.save_data()
-            self.update_menu()
+            # Ask for new reset date
+            date_response = rumps.Window(
+                title="Set Reset Date",
+                message="Enter the reset date for the new cycle (YYYY-MM-DD):\n\nExample: 2025-10-21",
+                default_text=datetime.now().strftime('%Y-%m-%d'),
+                ok="Set",
+                cancel="Cancel",
+                dimensions=(400, 20)
+            ).run()
             
-            rumps.notification(
-                title="Month Reset",
-                subtitle="Usage reset to 0",
-                message=""
-            )
+            if date_response.clicked:
+                try:
+                    # Validate date format
+                    test_date = datetime.strptime(date_response.text, '%Y-%m-%d')
+                    self.data['reset_date'] = date_response.text
+                    self.data['current_percentage'] = 0.0
+                    self.save_data()
+                    self.update_menu()
+                    
+                    rumps.notification(
+                        title="Cycle Reset",
+                        subtitle=f"Reset to 0% on {date_response.text}",
+                        message=""
+                    )
+                except ValueError:
+                    rumps.alert("Invalid Date", "Please use YYYY-MM-DD format (e.g., 2025-10-21)")
 
 
 if __name__ == "__main__":
